@@ -10,6 +10,8 @@ from agent_loader import AgentLoader
 from agent_creator import AgentCreator
 from task_manager import TaskManager
 from model_manager import ModelManager
+from tools.tool_registry import ToolRegistry
+from memory_manager import MemoryManager
 
 # Load environment variables
 load_dotenv()
@@ -19,6 +21,7 @@ LOGS_DIR = os.path.abspath("logs")
 os.makedirs(LOGS_DIR, exist_ok=True)
 log_file = os.path.join(LOGS_DIR, f"execution_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
 
+# Global/Root logger configuration
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -28,6 +31,30 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("NovaEdgeBuild")
+
+# Specialized Loggers Configuration (propagate = False to prevent duplicate/bubble-up logging)
+def _setup_specialized_logger(name: str, log_filename: str) -> logging.Logger:
+    spec_logger = logging.getLogger(name)
+    spec_logger.setLevel(logging.INFO)
+    spec_logger.propagate = False
+    
+    # Remove existing handlers to avoid duplicates on re-init
+    for handler in list(spec_logger.handlers):
+        spec_logger.removeHandler(handler)
+        
+    file_path = os.path.join(LOGS_DIR, log_filename)
+    fh = logging.FileHandler(file_path, encoding="utf-8")
+    fh.setLevel(logging.INFO)
+    
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    fh.setFormatter(formatter)
+    spec_logger.addHandler(fh)
+    return spec_logger
+
+provider_logger = _setup_specialized_logger("NovaEdgeBuild.Provider", "provider.log")
+tool_logger = _setup_specialized_logger("NovaEdgeBuild.Tool", "tool.log")
+workflow_logger = _setup_specialized_logger("NovaEdgeBuild.Workflow", "workflow.log")
+agent_logger = _setup_specialized_logger("NovaEdgeBuild.Agent", "agent.log")
 
 # ANSI Color Codes for Premium Console UI
 class Colors:
@@ -56,6 +83,8 @@ class NovaEdgeBuildSystem:
         self.loader = AgentLoader(agents_dir="agents")
         self.creator = AgentCreator(agents_dir="agents", registry_path="configs/agents_registry.json")
         self.task_manager = TaskManager(memory_dir="memory")
+        self.tool_registry = ToolRegistry()
+        self.memory_manager = MemoryManager(memory_dir="memory")
         
         # Initialize Model Manager
         self.model_manager = ModelManager()
@@ -74,6 +103,20 @@ class NovaEdgeBuildSystem:
                 self.creator.register_agent(profile["name"], f"{agent}.md", profile["role"])
             except Exception as e:
                 logger.warning(f"Could not auto-register starter agent {agent}: {e}")
+
+    def log_tool_usage(self, tool_name: str, args: dict, result: str):
+        """
+        Helper method to log tool usage to tool_logger and record in memory.
+        """
+        tool_logger.info(f"Tool: {tool_name} | Args: {json.dumps(args)} | Result: {result}")
+        if hasattr(self, 'memory_manager'):
+            self.memory_manager.record_tool_call(tool_name, args, result)
+
+    def log_agent_action(self, agent_name: str, action: str):
+        """
+        Helper method to log agent actions to agent_logger.
+        """
+        agent_logger.info(f"Agent: {agent_name} | Action: {action}")
 
     def run_command_loop(self):
         """
@@ -105,6 +148,7 @@ class NovaEdgeBuildSystem:
         """
         Loads the CEO agent and kicks off the orchestration process.
         """
+        workflow_logger.info(f"Initializing workflow for goal: '{goal}'")
         logger.info(f"Processing goal: {goal}")
         
         # Load CEO Agent
@@ -112,6 +156,14 @@ class NovaEdgeBuildSystem:
             ceo = self.loader.load_agent("ceo")
         except FileNotFoundError:
             logger.error("CEO agent profile (ceo.md) not found. Re-check the agents directory.")
+            workflow_logger.error("Workflow failed: CEO agent profile (ceo.md) not found.")
+            if hasattr(self, 'memory_manager'):
+                self.memory_manager.record_workflow_completion(
+                    goal=goal,
+                    root_task_id="unknown",
+                    status="failed",
+                    summary="CEO agent profile (ceo.md) not found."
+                )
             return
 
         print(f"\n{Colors.BLUE}{Colors.BOLD}[System] Launching CEO Agent to orchestrate task...{Colors.ENDC}")
@@ -122,6 +174,7 @@ class NovaEdgeBuildSystem:
             assigned_to="CEO"
         )
         self.task_manager.update_task(root_task_id, "in_progress")
+        workflow_logger.info(f"Workflow root task created with ID: {root_task_id}")
 
         # Define available tools schema for OpenAI function calling
         tools_schema = self._get_tools_schema()
@@ -135,62 +188,100 @@ class NovaEdgeBuildSystem:
         step = 1
         max_steps = 10  # Prevent infinite loops
         
-        while step <= max_steps:
-            logger.info(f"CEO Agent execution step {step}...")
+        workflow_status = "completed"
+        workflow_summary = ""
+        
+        try:
+            while step <= max_steps:
+                logger.info(f"CEO Agent execution step {step}...")
+                workflow_logger.info(f"Starting execution step {step}")
+                
+                if self.simulation_mode:
+                    workflow_logger.info(f"Simulation mode active. Generating simulated response for step {step}")
+                    response_text, tool_calls = self._simulate_ceo_response(goal, messages, step)
+                else:
+                    workflow_logger.info(f"Live mode active. Generating LLM response for step {step}")
+                    response_text, tool_calls = self._call_openai(messages, tools_schema)
+
+                # Log message to history
+                if response_text:
+                    print(f"\n{Colors.GREEN}{Colors.BOLD}[CEO Agent]:{Colors.ENDC}\n{response_text}")
+                    messages.append({"role": "assistant", "content": response_text})
+                    workflow_logger.info(f"Step {step} - Model Response: {response_text[:200]}...")
+                    
+                if not tool_calls:
+                    # CEO completed the execution path or has no further actions
+                    self.task_manager.update_task(root_task_id, "completed", response_text)
+                    print(f"\n{Colors.GREEN}{Colors.BOLD}[System] CEO has concluded the workflow orchestration.{Colors.ENDC}\n")
+                    workflow_logger.info("Workflow completed: CEO agent concluded the workflow orchestration.")
+                    workflow_summary = response_text or "CEO concluded workflow."
+                    break
+                    
+                # Process tool calls
+                for tool_call in tool_calls:
+                    tool_name = tool_call["name"]
+                    tool_args = tool_call["args"]
+                    tool_id = tool_call.get("id", "sim_id")
+                    
+                    print(f"\n{Colors.WARNING}{Colors.BOLD}[CEO Action Requested]: {tool_name}{Colors.ENDC}")
+                    print(f"Arguments: {json.dumps(tool_args, indent=2)}")
+                    
+                    workflow_logger.info(f"Step {step} - Tool call requested: {tool_name} with args: {json.dumps(tool_args)}")
+
+                    # Check for human in the loop for high risk actions
+                    if tool_name in ["create_agent", "execute_command", "request_human_approval"]:
+                        workflow_logger.info(f"Step {step} - Requesting human approval for high-risk action: {tool_name}")
+                        approved = self._request_user_approval(tool_name, tool_args)
+                        if not approved:
+                            tool_result = "Action denied by human operator."
+                            logger.warning(f"Action '{tool_name}' was rejected by user.")
+                            workflow_logger.warning(f"Step {step} - Human approval denied for: {tool_name}")
+                            messages.append({
+                                "role": "function",
+                                "name": tool_name,
+                                "content": tool_result
+                            })
+                            continue
+                        workflow_logger.info(f"Step {step} - Human approval granted for: {tool_name}")
+
+                    # Run the actual tool
+                    workflow_logger.info(f"Step {step} - Executing tool: {tool_name}")
+                    tool_result = self.execute_tool(tool_name, tool_args, root_task_id)
+                    workflow_logger.info(f"Step {step} - Tool execution result: {str(tool_result)[:200]}")
+                    
+                    # Add tool response back to OpenAI message context
+                    messages.append({
+                        "role": "function",
+                        "name": tool_name,
+                        "content": str(tool_result)
+                    })
+                    
+                step += 1
+
+            if step > max_steps:
+                logger.warning("Reached maximum orchestration steps. Stopping to prevent run away loops.")
+                self.task_manager.update_task(root_task_id, "failed", "Max steps exceeded.")
+                workflow_logger.error("Workflow failed: Maximum orchestration steps exceeded.")
+                workflow_status = "failed"
+                workflow_summary = "Max steps exceeded."
+                
+        except Exception as e:
+            logger.exception(f"Error during workflow execution: {e}")
+            workflow_logger.exception(f"Workflow execution encountered an error: {e}")
+            self.task_manager.update_task(root_task_id, "failed", str(e))
+            workflow_status = "failed"
+            workflow_summary = f"Error: {str(e)}"
             
-            if self.simulation_mode:
-                response_text, tool_calls = self._simulate_ceo_response(goal, messages, step)
-            else:
-                response_text, tool_calls = self._call_openai(messages, tools_schema)
-
-            # Log message to history
-            if response_text:
-                print(f"\n{Colors.GREEN}{Colors.BOLD}[CEO Agent]:{Colors.ENDC}\n{response_text}")
-                messages.append({"role": "assistant", "content": response_text})
-                
-            if not tool_calls:
-                # CEO completed the execution path or has no further actions
-                self.task_manager.update_task(root_task_id, "completed", response_text)
-                print(f"\n{Colors.GREEN}{Colors.BOLD}[System] CEO has concluded the workflow orchestration.{Colors.ENDC}\n")
-                break
-                
-            # Process tool calls
-            for tool_call in tool_calls:
-                tool_name = tool_call["name"]
-                tool_args = tool_call["args"]
-                tool_id = tool_call.get("id", "sim_id")
-                
-                print(f"\n{Colors.WARNING}{Colors.BOLD}[CEO Action Requested]: {tool_name}{Colors.ENDC}")
-                print(f"Arguments: {json.dumps(tool_args, indent=2)}")
-                
-                # Check for human in the loop for high risk actions
-                if tool_name in ["create_agent", "execute_command", "request_human_approval"]:
-                    approved = self._request_user_approval(tool_name, tool_args)
-                    if not approved:
-                        tool_result = "Action denied by human operator."
-                        logger.warning(f"Action '{tool_name}' was rejected by user.")
-                        messages.append({
-                            "role": "function",
-                            "name": tool_name,
-                            "content": tool_result
-                        })
-                        continue
-
-                # Run the actual tool
-                tool_result = self.execute_tool(tool_name, tool_args, root_task_id)
-                
-                # Add tool response back to OpenAI message context
-                messages.append({
-                    "role": "function",
-                    "name": tool_name,
-                    "content": str(tool_result)
-                })
-                
-            step += 1
-
-        if step > max_steps:
-            logger.warning("Reached maximum orchestration steps. Stopping to prevent run away loops.")
-            self.task_manager.update_task(root_task_id, "failed", "Max steps exceeded.")
+        finally:
+            # Record workflow completion in memory
+            if hasattr(self, 'memory_manager'):
+                self.memory_manager.record_workflow_completion(
+                    goal=goal,
+                    root_task_id=root_task_id,
+                    status=workflow_status,
+                    summary=workflow_summary
+                )
+                workflow_logger.info(f"Workflow recorded in memory. Status: {workflow_status}")
 
     def _call_openai(self, messages: list, tools: list) -> tuple:
         """
@@ -215,61 +306,25 @@ class NovaEdgeBuildSystem:
 
     def execute_tool(self, tool_name: str, args: dict, parent_task_id: str) -> str:
         """
-        Routes tool calls to their respective python implementation handlers.
+        Routes tool calls to their respective dynamic registry implementations.
         """
         logger.info(f"Executing tool {tool_name} with args: {args}")
         
-        if tool_name == "list_agents":
-            agents = self.loader.list_available_agents()
-            return json.dumps({"available_agents": agents})
-            
-        elif tool_name == "create_agent":
-            try:
-                filepath = self.creator.create_agent(
-                    name=args["name"],
-                    role=args["role"],
-                    goals=args["goals"],
-                    rules=args["rules"],
-                    responsibilities=args["responsibilities"],
-                    workflows=args["workflows"],
-                    tools=args["tools"]
-                )
-                return json.dumps({"status": "success", "filepath": filepath, "message": f"Agent '{args['name']}' created."})
-            except Exception as e:
-                logger.error(f"Failed to create agent: {e}")
-                return json.dumps({"status": "error", "message": str(e)})
-                
-        elif tool_name == "delegate_task":
-            agent_name = args["agent_name"]
-            task_desc = args["task_description"]
-            
-            # Create sub-task in task manager
-            sub_task_id = self.task_manager.create_task(
-                description=task_desc,
-                assigned_to=agent_name,
-                dependencies=[parent_task_id]
-            )
-            self.task_manager.update_task(sub_task_id, "in_progress")
-            
-            print(f"\n{Colors.BLUE}{Colors.BOLD}[System] Loading Sub-Agent: {agent_name}...{Colors.ENDC}")
-            
-            # Run sub-agent invocation
-            try:
-                sub_agent = self.loader.load_agent(agent_name)
-                result = self._execute_sub_agent(sub_agent, task_desc)
-                self.task_manager.update_task(sub_task_id, "completed", result)
-                return json.dumps({"status": "success", "sub_task_id": sub_task_id, "result": result})
-            except Exception as e:
-                logger.error(f"Failed to execute sub-agent {agent_name}: {e}")
-                self.task_manager.update_task(sub_task_id, "failed", str(e))
-                return json.dumps({"status": "error", "message": f"Sub-agent execution failed: {str(e)}"})
-                
-        elif tool_name == "request_human_approval":
-            # Already approved in pre-check, return status
-            return json.dumps({"status": "approved", "message": "Approval granted by operator."})
-            
-        else:
+        tool = self.tool_registry.get_tool(tool_name)
+        if not tool:
+            logger.error(f"Unknown tool '{tool_name}' requested.")
             return json.dumps({"status": "error", "message": f"Unknown tool '{tool_name}'"})
+        
+        context = {
+            "system": self,
+            "parent_task_id": parent_task_id
+        }
+        
+        try:
+            return tool.execute(args, context)
+        except Exception as e:
+            logger.exception(f"Exception during execution of tool {tool_name}: {e}")
+            return json.dumps({"status": "error", "message": str(e)})
 
     def _execute_sub_agent(self, agent_profile: dict, task_desc: str) -> str:
         """
@@ -310,58 +365,9 @@ class NovaEdgeBuildSystem:
 
     def _get_tools_schema(self) -> list:
         """
-        Specifies the functional capability schema for the orchestrating agent.
+        Specifies the functional capability schema for the orchestrating agent dynamically.
         """
-        return [
-            {
-                "name": "list_agents",
-                "description": "Lists all available specialized agents in the system.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {}
-                }
-            },
-            {
-                "name": "create_agent",
-                "description": "Spawns a new specialized agent profile dynamically on disk.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "CamelCase name of the agent, e.g. ContentWriterAgent"},
-                        "role": {"type": "string", "description": "Specific professional role description"},
-                        "goals": {"type": "array", "items": {"type": "string"}, "description": "High level objectives"},
-                        "responsibilities": {"type": "array", "items": {"type": "string"}, "description": "List of core responsibilities"},
-                        "workflows": {"type": "array", "items": {"type": "string"}, "description": "Step-by-step procedure sequences"},
-                        "tools": {"type": "array", "items": {"type": "string"}, "description": "Required technical tools"},
-                        "rules": {"type": "array", "items": {"type": "string"}, "description": "Operational rules and constraints"}
-                    },
-                    "required": ["name", "role", "goals", "responsibilities", "workflows", "tools", "rules"]
-                }
-            },
-            {
-                "name": "delegate_task",
-                "description": "Delegates a specific sub-task to a specialized agent and awaits their report.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "agent_name": {"type": "string", "description": "Name of target agent (e.g. 'seo_agent', 'social_media_agent')"},
-                        "task_description": {"type": "string", "description": "Detailed prompt instruction for the agent"}
-                    },
-                    "required": ["agent_name", "task_description"]
-                }
-            },
-            {
-                "name": "request_human_approval",
-                "description": "Requests explicit confirmation from the human supervisor before proceeding with high impact steps.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reason": {"type": "string", "description": "Detailed description of the risky action requiring approval"}
-                    },
-                    "required": ["reason"]
-                }
-            }
-        ]
+        return self.tool_registry.get_all_schemas()
 
     # --- OFFLINE SIMULATION HANDLERS ---
     def _simulate_ceo_response(self, goal: str, messages: list, step: int) -> tuple:

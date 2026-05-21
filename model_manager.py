@@ -4,7 +4,7 @@ import logging
 from providers.openrouter_provider import OpenRouterProvider
 from providers.ollama_provider import OllamaProvider
 
-logger = logging.getLogger("NovaEdgeBuild")
+logger = logging.getLogger("NovaEdgeBuild.Provider")
 
 class ModelManager:
     """

@@ -3,7 +3,7 @@ import time
 import logging
 from providers.base_provider import BaseProvider
 
-logger = logging.getLogger("NovaEdgeBuild")
+logger = logging.getLogger("NovaEdgeBuild.Provider")
 
 class OllamaProvider(BaseProvider):
     """
