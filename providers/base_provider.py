@@ -22,7 +22,7 @@ class BaseProvider(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def generate(self, system_prompt: str, user_prompt: str = None, messages: list = None, tools: list = None) -> tuple[str, list]:
+    def generate(self, system_prompt: str, user_prompt: str = None, messages: list = None, tools: list = None) -> tuple[str, list, dict]:
         """
         Executes raw text generation and tool routing.
         
@@ -33,6 +33,6 @@ class BaseProvider(abc.ABC):
             tools: Optional function calling schemas.
             
         Returns:
-            (str, list): (Response text content, list of requested tool calls)
+            (str, list, dict): (Response text content, list of requested tool calls, metadata)
         """
         pass

@@ -134,31 +134,66 @@ class AgentLoader:
         """
         Compiles structural metadata and raw markdown instructions into a detailed system prompt.
         """
-        prompt_parts = []
-        prompt_parts.append(f"# IDENTITY")
-        prompt_parts.append(f"Name: {metadata.get('name', 'AI Agent')}")
-        prompt_parts.append(f"Role: {metadata.get('role', 'Specialized Workforce Unit')}\n")
+        local_mode = os.getenv("LOCAL_MODEL_MODE", "false").lower() == "true"
         
-        if metadata.get("goals"):
-            prompt_parts.append("## PRIMARY GOALS")
-            for goal in metadata["goals"]:
-                prompt_parts.append(f"- {goal}")
-            prompt_parts.append("")
-            
-        if metadata.get("rules"):
-            prompt_parts.append("## OPERATIONAL RULES & CONSTRAINTS")
-            for rule in metadata["rules"]:
-                prompt_parts.append(f"- {rule}")
-            prompt_parts.append("")
+        def _stringify_list(items):
+            res = []
+            for item in items:
+                if isinstance(item, dict):
+                    # For YAML lists of single key-value dicts (e.g. - tool_name: tool_desc)
+                    for k, v in item.items():
+                        res.append(f"{k}: {v}")
+                else:
+                    res.append(str(item))
+            return res
 
-        if metadata.get("tools"):
-            prompt_parts.append("## ASSIGNED TOOLS (Capabilities)")
-            for tool in metadata["tools"]:
-                prompt_parts.append(f"- {tool}")
-            prompt_parts.append("")
+        prompt_parts = []
+        if local_mode:
+            prompt_parts.append(f"ROLE: {metadata.get('name', 'Agent')} - {metadata.get('role', 'Specialist')}")
+            if metadata.get("goals"):
+                # Only include first 3 goals max
+                goals_list = _stringify_list(metadata["goals"])[:3]
+                prompt_parts.append("GOALS: " + " | ".join(goals_list))
+            if metadata.get("rules"):
+                rules_list = _stringify_list(metadata["rules"])[:2]
+                prompt_parts.append("RULES: " + " | ".join(rules_list))
+            if metadata.get("tools"):
+                prompt_parts.append("TOOLS: " + ", ".join(_stringify_list(metadata["tools"])))
             
-        prompt_parts.append("# PROFILE DETAILS & INSTRUCTIONS")
-        prompt_parts.append(markdown_content)
+            # Aggressively compress markdown content for local models
+            compact_md = re.sub(r'#+\s+', '', markdown_content)
+            compact_md = re.sub(r'\n{2,}', '\n', compact_md)
+            compact_md = re.sub(r'[*_`#>]', '', compact_md)  # Strip markdown formatting
+            compact_md = re.sub(r'\s{2,}', ' ', compact_md)  # Collapse whitespace
+            # Truncate to max 500 chars to save tokens
+            if len(compact_md) > 500:
+                compact_md = compact_md[:500] + "..."
+            prompt_parts.append("CONTEXT:\n" + compact_md.strip())
+        else:
+            prompt_parts.append(f"# IDENTITY")
+            prompt_parts.append(f"Name: {metadata.get('name', 'AI Agent')}")
+            prompt_parts.append(f"Role: {metadata.get('role', 'Specialized Workforce Unit')}\n")
+            
+            if metadata.get("goals"):
+                prompt_parts.append("## PRIMARY GOALS")
+                for goal in _stringify_list(metadata["goals"]):
+                    prompt_parts.append(f"- {goal}")
+                prompt_parts.append("")
+                
+            if metadata.get("rules"):
+                prompt_parts.append("## OPERATIONAL RULES & CONSTRAINTS")
+                for rule in _stringify_list(metadata["rules"]):
+                    prompt_parts.append(f"- {rule}")
+                prompt_parts.append("")
+
+            if metadata.get("tools"):
+                prompt_parts.append("## ASSIGNED TOOLS (Capabilities)")
+                for tool in _stringify_list(metadata["tools"]):
+                    prompt_parts.append(f"- {tool}")
+                prompt_parts.append("")
+                
+            prompt_parts.append("# PROFILE DETAILS & INSTRUCTIONS")
+            prompt_parts.append(markdown_content)
         
         return "\n".join(prompt_parts)
 

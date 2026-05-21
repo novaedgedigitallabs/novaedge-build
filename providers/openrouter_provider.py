@@ -31,7 +31,7 @@ class OpenRouterProvider(BaseProvider):
             return False, "OpenRouter client was not successfully initialized."
         return True, "OpenRouter configured and ready."
 
-    def generate(self, system_prompt: str, user_prompt: str = None, messages: list = None, tools: list = None) -> tuple[str, list]:
+    def generate(self, system_prompt: str, user_prompt: str = None, messages: list = None, tools: list = None) -> tuple[str, list, dict]:
         if not self.client:
             raise ValueError("OpenRouter client not initialized. Check API keys.")
 
@@ -92,8 +92,13 @@ class OpenRouterProvider(BaseProvider):
                         "name": tc.function.name,
                         "args": json.loads(tc.function.arguments)
                     })
+            metadata = {
+                "elapsed": elapsed,
+                "model": self.model,
+                "usage": response.usage.model_dump() if hasattr(response, "usage") and response.usage else {}
+            }
                     
-            return response_text, tool_calls
+            return response_text, tool_calls, metadata
 
         except Exception as e:
             elapsed = time.time() - start_time

@@ -198,10 +198,10 @@ class NovaEdgeBuildSystem:
                 
                 if self.simulation_mode:
                     workflow_logger.info(f"Simulation mode active. Generating simulated response for step {step}")
-                    response_text, tool_calls = self._simulate_ceo_response(goal, messages, step)
+                    response_text, tool_calls, metadata = self._simulate_ceo_response(goal, messages, step)
                 else:
                     workflow_logger.info(f"Live mode active. Generating LLM response for step {step}")
-                    response_text, tool_calls = self._call_openai(messages, tools_schema)
+                    response_text, tool_calls, metadata = self._call_openai(messages, tools_schema)
 
                 # Log message to history
                 if response_text:
@@ -236,11 +236,18 @@ class NovaEdgeBuildSystem:
                             tool_result = "Action denied by human operator."
                             logger.warning(f"Action '{tool_name}' was rejected by user.")
                             workflow_logger.warning(f"Step {step} - Human approval denied for: {tool_name}")
-                            messages.append({
-                                "role": "function",
-                                "name": tool_name,
-                                "content": tool_result
-                            })
+                            local_mode_check = os.getenv("LOCAL_MODEL_MODE", "false").lower() == "true"
+                            if local_mode_check:
+                                messages.append({
+                                    "role": "user",
+                                    "content": f"[TOOL_RESULT] Action '{tool_name}' was denied by human operator. Proceed without this action."
+                                })
+                            else:
+                                messages.append({
+                                    "role": "function",
+                                    "name": tool_name,
+                                    "content": tool_result
+                                })
                             continue
                         workflow_logger.info(f"Step {step} - Human approval granted for: {tool_name}")
 
@@ -249,12 +256,20 @@ class NovaEdgeBuildSystem:
                     tool_result = self.execute_tool(tool_name, tool_args, root_task_id)
                     workflow_logger.info(f"Step {step} - Tool execution result: {str(tool_result)[:200]}")
                     
-                    # Add tool response back to OpenAI message context
-                    messages.append({
-                        "role": "function",
-                        "name": tool_name,
-                        "content": str(tool_result)
-                    })
+                    # Add tool response back to message context
+                    # Local models don't understand 'function' role — use 'user' with formatting
+                    local_mode = os.getenv("LOCAL_MODEL_MODE", "false").lower() == "true"
+                    if local_mode:
+                        messages.append({
+                            "role": "user",
+                            "content": f"[TOOL_RESULT] Tool '{tool_name}' returned:\n{str(tool_result)}\n\nBased on this result, provide your final_response to the user. Do NOT call tools again unless absolutely necessary."
+                        })
+                    else:
+                        messages.append({
+                            "role": "function",
+                            "name": tool_name,
+                            "content": str(tool_result)
+                        })
                     
                 step += 1
 
@@ -302,7 +317,7 @@ class NovaEdgeBuildSystem:
         except Exception as e:
             logger.error(f"Model manager inference call failed: {e}")
             print(f"{Colors.FAIL}Error communicating with LLM provider. Switching this turn to simulation.{Colors.ENDC}")
-            return "Error calling LLM provider. Switched to fallback simulation.", []
+            return "Error calling LLM provider. Switched to fallback simulation.", [], {}
 
     def execute_tool(self, tool_name: str, args: dict, parent_task_id: str) -> str:
         """
@@ -337,7 +352,7 @@ class NovaEdgeBuildSystem:
             return self._simulate_sub_agent_response(agent_profile["name"], task_desc)
             
         try:
-            response_text, _ = self.model_manager.generate(
+            response_text, _, _ = self.model_manager.generate(
                 system_prompt=agent_profile["system_prompt"],
                 user_prompt=f"Execute this task and provide structured results: {task_desc}"
             )
@@ -367,7 +382,20 @@ class NovaEdgeBuildSystem:
         """
         Specifies the functional capability schema for the orchestrating agent dynamically.
         """
-        return self.tool_registry.get_all_schemas()
+        schemas = self.tool_registry.get_all_schemas()
+        local_mode = os.getenv("LOCAL_MODEL_MODE", "false").lower() == "true"
+        if local_mode:
+            # Compress schema for local mode to reduce tokens
+            for schema in schemas:
+                # Strip long descriptions
+                if "description" in schema:
+                    # Keep only first sentence of description
+                    schema["description"] = schema["description"].split('.')[0] + "."
+                if "parameters" in schema and "properties" in schema["parameters"]:
+                    for prop_name, prop_val in schema["parameters"]["properties"].items():
+                        if "description" in prop_val:
+                            prop_val["description"] = prop_val["description"].split('.')[0] + "."
+        return schemas
 
     # --- OFFLINE SIMULATION HANDLERS ---
     def _simulate_ceo_response(self, goal: str, messages: list, step: int) -> tuple:
@@ -377,7 +405,7 @@ class NovaEdgeBuildSystem:
         if step == 1:
             text = "Analyzing the user's objective. I need to list existing workforce capabilities before mapping out task delegation."
             tool_calls = [{"name": "list_agents", "args": {}}]
-            return text, tool_calls
+            return text, tool_calls, {}
             
         elif step == 2:
             # Let's inspect the user goal to simulate customized delegation
@@ -424,14 +452,14 @@ class NovaEdgeBuildSystem:
                         "rules": ["Follow clean schema conventions", "Ensure primary and foreign keys are explicitly named"]
                     }
                 }]
-            return text, tool_calls
+            return text, tool_calls, {}
             
         elif step == 3:
             # After delegation, return summary and finish
             text = f"I have collected the outputs and completed the orchestration process for '{goal}'. The tasks have been successfully processed, logged to disk, and verified."
-            return text, []
+            return text, [], {}
             
-        return "Task complete.", []
+        return "Task complete.", [], {}
 
     def _simulate_sub_agent_response(self, agent_name: str, task_desc: str) -> str:
         """

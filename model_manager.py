@@ -68,31 +68,35 @@ class ModelManager:
                     self.active_provider = None
         print()
 
-    def generate(self, system_prompt: str, user_prompt: str = None, messages: list = None, tools: list = None) -> tuple[str, list]:
+    def generate(self, system_prompt: str, user_prompt: str = None, messages: list = None, tools: list = None) -> tuple[str, list, dict]:
         """
         Routes the request to the active provider with automatic fallback logic.
+        Uses cached validation from startup to avoid re-validating on every call.
         """
-        or_valid, or_msg = self.openrouter.validate()
-        ollama_valid, ollama_msg = self.ollama.validate()
-
         # CASE 1: Forced OpenRouter Mode
         if self.provider_mode == "openrouter":
             print(f"[Provider] OpenRouter active")
             logger.info(f"Inference routed to OpenRouter: model={self.openrouter.model}")
-            if not or_valid:
-                raise RuntimeError(f"OpenRouter provider validation failed: {or_msg}")
+            if self.active_provider is None:
+                or_valid, or_msg = self.openrouter.validate()
+                if not or_valid:
+                    raise RuntimeError(f"OpenRouter provider validation failed: {or_msg}")
+                self.active_provider = self.openrouter
             return self.openrouter.generate(system_prompt, user_prompt, messages, tools)
 
         # CASE 2: Forced Ollama Mode
         if self.provider_mode == "ollama":
             print(f"[Provider] Ollama active")
             logger.info(f"Inference routed to Ollama: model={self.ollama.model}")
-            if not ollama_valid:
-                raise RuntimeError(f"Ollama provider validation failed: {ollama_msg}")
+            if self.active_provider is None:
+                ollama_valid, ollama_msg = self.ollama.validate()
+                if not ollama_valid:
+                    raise RuntimeError(f"Ollama provider validation failed: {ollama_msg}")
+                self.active_provider = self.ollama
             return self.ollama.generate(system_prompt, user_prompt, messages, tools)
 
         # CASE 3: Auto mode (automatic fallback logic)
-        if or_valid:
+        if self.active_provider == self.openrouter:
             try:
                 print(f"[Provider] OpenRouter active")
                 logger.info(f"Attempting inference via OpenRouter (model={self.openrouter.model})...")
@@ -102,17 +106,23 @@ class ModelManager:
                 print(f"[Provider] Ollama fallback active")
                 logger.warning(f"OpenRouter generation failed: {e}. Initiating Ollama fallback.")
                 
-                # Check if Ollama is actually configured and running
+                # Re-validate Ollama only on fallback
+                ollama_valid, ollama_msg = self.ollama.validate()
                 if not ollama_valid:
                     logger.critical(f"Ollama fallback target is unavailable: {ollama_msg}")
                     raise RuntimeError(f"OpenRouter failed, and local Ollama fallback is unavailable: {ollama_msg}") from e
                     
+                self.active_provider = self.ollama
                 logger.info(f"Executing fallback inference via local Ollama (model={self.ollama.model})...")
                 return self.ollama.generate(system_prompt, user_prompt, messages, tools)
         else:
-            # Fallback directly to Ollama since OpenRouter API key was not found or is invalid
+            # Active provider is Ollama (or None with auto mode)
+            if self.active_provider is None:
+                # Re-validate on first call if startup failed
+                ollama_valid, ollama_msg = self.ollama.validate()
+                if not ollama_valid:
+                    raise RuntimeError(f"Ollama provider is unavailable: {ollama_msg}")
+                self.active_provider = self.ollama
             print(f"[Provider] Ollama fallback active")
-            logger.info(f"Routing directly to Ollama (OpenRouter key missing/invalid). model={self.ollama.model}")
-            if not ollama_valid:
-                raise RuntimeError(f"Ollama provider is unavailable: {ollama_msg}")
+            logger.info(f"Routing directly to Ollama. model={self.ollama.model}")
             return self.ollama.generate(system_prompt, user_prompt, messages, tools)
