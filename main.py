@@ -4,6 +4,10 @@ import json
 import logging
 from datetime import datetime
 from dotenv import load_dotenv
+import threading
+import asyncio
+import websockets
+import uuid
 
 # Import our modular AI architecture components
 from agent_loader import AgentLoader
@@ -12,6 +16,7 @@ from task_manager import TaskManager
 from model_manager import ModelManager
 from tools.tool_registry import ToolRegistry
 from memory_manager import MemoryManager
+from semantic_memory import RetrievalEngine
 
 # Load environment variables
 load_dotenv()
@@ -31,6 +36,29 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("NovaEdgeBuild")
+
+# --- WEBSOCKET SERVER ---
+ws_clients = set()
+ws_loop = None
+
+async def ws_handler(websocket):
+    ws_clients.add(websocket)
+    try:
+        await websocket.wait_closed()
+    finally:
+        ws_clients.remove(websocket)
+
+def start_ws_server():
+    global ws_loop
+    ws_loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(ws_loop)
+    
+    async def serve():
+        async with websockets.serve(ws_handler, "0.0.0.0", 8000):
+            logger.info("WebSocket Observability Server running on ws://0.0.0.0:8000")
+            await asyncio.Future()  # run forever
+            
+    ws_loop.run_until_complete(serve())
 
 # Specialized Loggers Configuration (propagate = False to prevent duplicate/bubble-up logging)
 def _setup_specialized_logger(name: str, log_filename: str) -> logging.Logger:
@@ -85,6 +113,7 @@ class NovaEdgeBuildSystem:
         self.task_manager = TaskManager(memory_dir="memory")
         self.tool_registry = ToolRegistry()
         self.memory_manager = MemoryManager(memory_dir="memory")
+        self.semantic_memory = RetrievalEngine()
         
         # Initialize Model Manager
         self.model_manager = ModelManager()
@@ -93,8 +122,24 @@ class NovaEdgeBuildSystem:
             logger.warning("No valid model provider could be validated on startup. NovaEdge Build will run in SIMULATION MODE.")
             self.simulation_mode = True
 
+        # Start WebSocket Server
+        self.ws_thread = threading.Thread(target=start_ws_server, daemon=True)
+        self.ws_thread.start()
+
         # Pre-register our starter agents in registry if not already done
         self._ensure_starter_agents_registered()
+
+    def broadcast_event(self, event_type: str, data: dict):
+        """Broadcast real-time observability data to connected Next.js dashboard clients."""
+        if not ws_loop:
+            return
+        message = json.dumps({"type": event_type, "data": data})
+        
+        async def send_to_clients():
+            if ws_clients:
+                await asyncio.gather(*[client.send(message) for client in ws_clients], return_exceptions=True)
+                
+        asyncio.run_coroutine_threadsafe(send_to_clients(), ws_loop)
 
     def _ensure_starter_agents_registered(self):
         for agent in ["ceo", "seo_agent", "social_media_agent", "website_agent"]:
@@ -175,13 +220,54 @@ class NovaEdgeBuildSystem:
         )
         self.task_manager.update_task(root_task_id, "in_progress")
         workflow_logger.info(f"Workflow root task created with ID: {root_task_id}")
+        
+        self.broadcast_event("task_update", {
+            "id": root_task_id,
+            "title": goal,
+            "assignedTo": "CEO",
+            "status": "running",
+            "createdAt": datetime.utcnow().isoformat() + "Z"
+        })
 
         # Define available tools schema for OpenAI function calling
         tools_schema = self._get_tools_schema()
         
+        # Retrieve Semantic Context
+        try:
+            business_context = self.semantic_memory.retrieve_context("business", goal, limit=2)
+            workflow_context = self.semantic_memory.retrieve_context("workflows", goal, limit=3)
+            user_prefs = self.semantic_memory.retrieve_context("user_preferences", goal, limit=1)
+            
+            context_text = "### SEMANTIC MEMORY CONTEXT ###\n"
+            has_context = False
+            
+            if business_context:
+                has_context = True
+                context_text += "Business Goals/Rules:\n"
+                for m in business_context:
+                    context_text += f"- {m['content']}\n"
+            if workflow_context:
+                has_context = True
+                context_text += "\nPast Similar Workflows:\n"
+                for m in workflow_context:
+                    context_text += f"- {m['content']}\n"
+            if user_prefs:
+                has_context = True
+                context_text += "\nUser Preferences:\n"
+                for m in user_prefs:
+                    context_text += f"- {m['content']}\n"
+            context_text += "################################\n\n"
+            
+            system_prompt = ceo["system_prompt"]
+            if has_context:
+                system_prompt = context_text + system_prompt
+        except Exception as e:
+            logger.error(f"Failed to retrieve semantic context: {e}")
+            system_prompt = ceo["system_prompt"]
+
         # Execution loop for agent conversation & tool execution
         messages = [
-            {"role": "system", "content": ceo["system_prompt"]},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": f"User Goal: {goal}\nRoot Task ID: {root_task_id}"}
         ]
         
@@ -198,9 +284,17 @@ class NovaEdgeBuildSystem:
                 
                 if self.simulation_mode:
                     workflow_logger.info(f"Simulation mode active. Generating simulated response for step {step}")
+                    self.broadcast_event("workflow_event", {
+                        "id": str(uuid.uuid4()), "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "type": "ceo_reasoning", "agent": "CEO", "content": f"Processing context and generating reasoning for step {step}...", "status": "success"
+                    })
                     response_text, tool_calls, metadata = self._simulate_ceo_response(goal, messages, step)
                 else:
                     workflow_logger.info(f"Live mode active. Generating LLM response for step {step}")
+                    self.broadcast_event("workflow_event", {
+                        "id": str(uuid.uuid4()), "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "type": "ceo_reasoning", "agent": "CEO", "content": f"Processing context and generating reasoning for step {step}...", "status": "success"
+                    })
                     response_text, tool_calls, metadata = self._call_openai(messages, tools_schema)
 
                 # Log message to history
@@ -214,6 +308,18 @@ class NovaEdgeBuildSystem:
                     self.task_manager.update_task(root_task_id, "completed", response_text)
                     print(f"\n{Colors.GREEN}{Colors.BOLD}[System] CEO has concluded the workflow orchestration.{Colors.ENDC}\n")
                     workflow_logger.info("Workflow completed: CEO agent concluded the workflow orchestration.")
+                    
+                    self.broadcast_event("task_update", {
+                        "id": root_task_id,
+                        "status": "completed",
+                        "completedAt": datetime.utcnow().isoformat() + "Z",
+                        "result": "CEO concluded workflow."
+                    })
+                    self.broadcast_event("workflow_event", {
+                        "id": str(uuid.uuid4()), "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "type": "workflow_complete", "agent": "CEO", "content": "CEO agent concluded the workflow orchestration.", "status": "success"
+                    })
+                    
                     workflow_summary = response_text or "CEO concluded workflow."
                     break
                     
@@ -227,6 +333,12 @@ class NovaEdgeBuildSystem:
                     print(f"Arguments: {json.dumps(tool_args, indent=2)}")
                     
                     workflow_logger.info(f"Step {step} - Tool call requested: {tool_name} with args: {json.dumps(tool_args)}")
+
+                    self.broadcast_event("workflow_event", {
+                        "id": str(uuid.uuid4()), "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "type": "tool_call", "agent": "CEO", "content": f"Invoking {tool_name}", 
+                        "toolName": tool_name, "toolArgs": tool_args, "status": "success"
+                    })
 
                     # Check for human in the loop for high risk actions
                     if tool_name in ["create_agent", "execute_command", "request_human_approval"]:
@@ -255,6 +367,12 @@ class NovaEdgeBuildSystem:
                     workflow_logger.info(f"Step {step} - Executing tool: {tool_name}")
                     tool_result = self.execute_tool(tool_name, tool_args, root_task_id)
                     workflow_logger.info(f"Step {step} - Tool execution result: {str(tool_result)[:200]}")
+                    
+                    self.broadcast_event("workflow_event", {
+                        "id": str(uuid.uuid4()), "timestamp": datetime.utcnow().isoformat() + "Z",
+                        "type": "tool_result", "agent": "CEO", "content": f"{tool_name} returned: {str(tool_result)[:200]}...",
+                        "toolName": tool_name, "status": "success"
+                    })
                     
                     # Add tool response back to message context
                     # Local models don't understand 'function' role — use 'user' with formatting
@@ -297,6 +415,17 @@ class NovaEdgeBuildSystem:
                     summary=workflow_summary
                 )
                 workflow_logger.info(f"Workflow recorded in memory. Status: {workflow_status}")
+            
+            # Record in semantic memory
+            if hasattr(self, 'semantic_memory'):
+                try:
+                    self.semantic_memory.summarize_and_store_workflow(
+                        goal=goal,
+                        tasks=[],
+                        result=f"Status: {workflow_status}, Summary: {workflow_summary}"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to store semantic workflow memory: {e}")
 
     def _call_openai(self, messages: list, tools: list) -> tuple:
         """
