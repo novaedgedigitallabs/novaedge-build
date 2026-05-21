@@ -1,0 +1,26 @@
+{
+    "CEO": {
+        "filename": "ceo.md",
+        "role": "Chief Executive Officer Agent",
+        "status": "active",
+        "created_by": "CEOAgent"
+    },
+    "SEOAgent": {
+        "filename": "seo_agent.md",
+        "role": "Search Engine Optimization Specialist Agent",
+        "status": "active",
+        "created_by": "CEOAgent"
+    },
+    "SocialMediaAgent": {
+        "filename": "social_media_agent.md",
+        "role": "Social Media Marketing & Brand Builder Agent",
+        "status": "active",
+        "created_by": "CEOAgent"
+    },
+    "WebsiteAgent": {
+        "filename": "website_agent.md",
+        "role": "Website Builder & UI/UX Design Specialist Agent",
+        "status": "active",
+        "created_by": "CEOAgent"
+    }
+}
